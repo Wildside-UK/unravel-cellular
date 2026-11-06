@@ -29,6 +29,9 @@ const STALE_AFTER: Duration = Duration::from_secs(30);
 struct RateState {
     current_kbps: f64,
     safe_rates: VecDeque<f64>,
+    /// Local patch: how many safe rates are real samples rather than the
+    /// startup seeds (75-95% of base). Real samples sit at the back.
+    observed: usize,
 }
 
 impl RateState {
@@ -42,6 +45,7 @@ impl RateState {
         Self {
             current_kbps: base_speed,
             safe_rates: rates,
+            observed: 0,
         }
     }
 
@@ -52,20 +56,24 @@ impl RateState {
         deltas: &[f64],
         delay_threshold_ms: f64,
         high_load_level: f64,
+        low_load_cut_floor: f64,
+        idle_recovery_pct: f64,
         rng: &mut fastrand::Rng,
-    ) -> f64 {
+    ) -> (f64, &'static str) {
         let mut next_kbps = self.current_kbps;
+        let mut reason = "hold";
 
         if !deltas.is_empty() {
             let delta = deltas[deltas.len() / 2];
+            let load = traffic_kbps / self.current_kbps;
 
             if delta > 0.0 {
-                let load = traffic_kbps / self.current_kbps;
 
                 if delta < delay_threshold_ms && load > high_load_level {
                     self.safe_rates.pop_front();
                     self.safe_rates
                         .push_back((self.current_kbps * load).floor());
+                    self.observed = (self.observed + 1).min(self.safe_rates.len());
 
                     let max_rate = self
                         .safe_rates
@@ -76,16 +84,52 @@ impl RateState {
                     next_kbps = self.current_kbps
                         * (1.0 + 0.1 * (1.0_f64 - self.current_kbps / max_rate).max(0.0))
                         + (shaper.base_kbps * 0.03);
+                    reason = "raise";
                 }
 
                 if delta > delay_threshold_ms {
                     let rnd_rate = self.safe_rates[rng.usize(..self.safe_rates.len())];
                     next_kbps = rnd_rate.min(0.9 * self.current_kbps * load);
+                    reason = "cut";
+
+                    // Local patch: at low load, one tick over the threshold may
+                    // only take the rate down to a fraction of where it was.
+                    if low_load_cut_floor > 0.0 && load <= high_load_level {
+                        let capped = self.current_kbps * low_load_cut_floor;
+                        if next_kbps < capped {
+                            next_kbps = capped;
+                            reason = "cut-capped";
+                        }
+                    }
+                }
+            }
+
+            // Local patch: with the delay under the threshold and the link not
+            // busy, drift toward the median of the safe-rate history. Outside
+            // the delta > 0 check, as the idle median delta is often exactly 0.
+            // Only real samples count: the startup seeds would pull an idle
+            // link up to 75-95% of base after every restart.
+            if idle_recovery_pct > 0.0
+                && self.observed > 0
+                && delta <= delay_threshold_ms
+                && load <= high_load_level
+            {
+                let skip = self.safe_rates.len() - self.observed;
+                let mut rates: Vec<f64> = self.safe_rates.iter().skip(skip).copied().collect();
+                rates.sort_by(f64::total_cmp);
+                let target = rates[rates.len() / 2].max(shaper.min_kbps);
+                let step = shaper.base_kbps * idle_recovery_pct / 100.0;
+                if self.current_kbps < target {
+                    next_kbps = (self.current_kbps + step).min(target);
+                    reason = "recover-up";
+                } else if self.current_kbps > target {
+                    next_kbps = (self.current_kbps - step).max(target);
+                    reason = "recover-down";
                 }
             }
         }
 
-        next_kbps.max(shaper.min_kbps).floor()
+        (next_kbps.max(shaper.min_kbps).floor(), reason)
     }
 }
 
@@ -319,13 +363,25 @@ impl SqmaLaw {
             };
 
             let load = traffic_kbps / state.current_kbps;
-            let next = state.calculate_rate(
+            let (next, reason) = state.calculate_rate(
                 shaper,
                 traffic_kbps,
                 deltas,
                 delay_ms,
                 self.settings.advanced_settings.high_load_level,
+                self.settings.advanced_settings.low_load_cut_floor,
+                self.settings.advanced_settings.idle_recovery_pct,
                 &mut self.rng,
+            );
+
+            debug!(
+                "Decision {:?}: median delta {:.2} ms, load {:.3}, rate {} -> {} kbit ({})",
+                direction,
+                deltas[deltas.len() / 2],
+                load,
+                state.current_kbps,
+                next,
+                reason
             );
 
             if next != state.current_kbps {
@@ -516,5 +572,119 @@ impl ReflectorState {
         self.valid = true;
 
         false
+    }
+}
+
+#[cfg(test)]
+mod local_patch_tests {
+    use super::*;
+    use crate::runtime::Shaper;
+
+    const TH: f64 = 25.0;
+    const HIGH: f64 = 0.8;
+
+    fn state(current: f64) -> (RateState, fastrand::Rng) {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut st = RateState::new(20000.0, 100, &mut rng);
+        st.current_kbps = current;
+        (st, rng)
+    }
+
+    fn deltas(median: f64) -> Vec<f64> {
+        vec![median - 10.0, median - 5.0, median, median + 5.0, median + 10.0]
+    }
+
+    #[test]
+    fn off_matches_upstream_low_load_cut_goes_to_floor() {
+        // 5 Nov run 1: 12000 kbit, 7.3% load, median 26.19 ms.
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.0, 0.0, &mut rng);
+        assert_eq!(next, 5000.0);
+        assert_eq!(why, "cut");
+    }
+
+    #[test]
+    fn cap_limits_a_single_low_load_cut() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.7, 0.0, &mut rng);
+        assert_eq!(next, 8400.0);
+        assert_eq!(why, "cut-capped");
+    }
+
+    #[test]
+    fn sustained_low_load_delay_still_reaches_the_floor() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let mut seen = vec![];
+        for _ in 0..4 {
+            let traffic = st.current_kbps * 0.08;
+            let (next, _) = st.calculate_rate(&shaper, traffic, &deltas(35.0), TH, HIGH, 0.7, 0.0, &mut rng);
+            st.current_kbps = next;
+            seen.push(next);
+        }
+        assert_eq!(seen, vec![8400.0, 5880.0, 5000.0, 5000.0]);
+    }
+
+    #[test]
+    fn high_load_cut_is_not_capped() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let (next, why) = st.calculate_rate(&shaper, 11000.0, &deltas(30.0), TH, HIGH, 0.7, 0.0, &mut rng);
+        assert!(next <= 0.9 * 11000.0, "got {next}");
+        assert_eq!(why, "cut");
+    }
+
+    #[test]
+    fn no_recovery_from_startup_seeds_alone() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(5000.0);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(0.0), TH, HIGH, 0.7, 3.0, &mut rng);
+        assert_eq!((next, why), (5000.0, "hold"));
+    }
+
+    fn with_observed(st: &mut RateState, real: &[f64]) {
+        for r in real {
+            st.safe_rates.pop_front();
+            st.safe_rates.push_back(*r);
+        }
+        st.observed = real.len();
+    }
+
+    #[test]
+    fn recovery_steps_up_to_the_real_median_even_at_zero_delta() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(5000.0);
+        with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
+        let mut path = vec![];
+        for _ in 0..12 {
+            let (next, _) = st.calculate_rate(&shaper, 50.0, &[-1.0, 0.0, 0.0, 0.5, 1.0], TH, HIGH, 0.7, 3.0, &mut rng);
+            st.current_kbps = next;
+            path.push(next);
+        }
+        assert_eq!(path[0], 5600.0);
+        assert_eq!(*path.last().unwrap(), 11000.0);
+        assert!(path.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    #[test]
+    fn recovery_steps_down_toward_the_real_median() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(15000.0);
+        with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(3.0), TH, HIGH, 0.7, 3.0, &mut rng);
+        assert_eq!((next, why), (14400.0, "recover-down"));
+    }
+
+    #[test]
+    fn busy_link_is_left_to_the_upstream_logic() {
+        // High load and low delay: the normal raise, not recovery.
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(10000.0);
+        with_observed(&mut st, &[6000.0, 6000.0, 6000.0]);
+        let (next, why) = st.calculate_rate(&shaper, 9500.0, &deltas(10.0), TH, HIGH, 0.7, 3.0, &mut rng);
+        assert_eq!(why, "raise");
+        assert!(next > 10000.0);
     }
 }
