@@ -58,6 +58,7 @@ impl RateState {
         high_load_level: f64,
         low_load_cut_floor: f64,
         idle_recovery_pct: f64,
+        low_load_level: f64,
         rng: &mut fastrand::Rng,
     ) -> (f64, &'static str) {
         let mut next_kbps = self.current_kbps;
@@ -94,7 +95,7 @@ impl RateState {
 
                     // Local patch: at low load, one tick over the threshold may
                     // only take the rate down to a fraction of where it was.
-                    if low_load_cut_floor > 0.0 && load <= high_load_level {
+                    if low_load_cut_floor > 0.0 && load <= low_load_level {
                         let capped = self.current_kbps * low_load_cut_floor;
                         if next_kbps < capped {
                             next_kbps = capped;
@@ -112,7 +113,7 @@ impl RateState {
             if idle_recovery_pct > 0.0
                 && self.observed > 0
                 && delta <= delay_threshold_ms
-                && load <= high_load_level
+                && load <= low_load_level
             {
                 let skip = self.safe_rates.len() - self.observed;
                 let mut rates: Vec<f64> = self.safe_rates.iter().skip(skip).copied().collect();
@@ -371,6 +372,7 @@ impl SqmaLaw {
                 self.settings.advanced_settings.high_load_level,
                 self.settings.advanced_settings.low_load_cut_floor,
                 self.settings.advanced_settings.idle_recovery_pct,
+                self.settings.advanced_settings.low_load_level,
                 &mut self.rng,
             );
 
@@ -599,7 +601,7 @@ mod local_patch_tests {
         // 5 Nov run 1: 12000 kbit, 7.3% load, median 26.19 ms.
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(12000.0);
-        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.0, 0.0, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.0, 0.0, 0.3, &mut rng);
         assert_eq!(next, 5000.0);
         assert_eq!(why, "cut");
     }
@@ -608,7 +610,7 @@ mod local_patch_tests {
     fn cap_limits_a_single_low_load_cut() {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(12000.0);
-        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.7, 0.0, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.7, 0.0, 0.3, &mut rng);
         assert_eq!(next, 8400.0);
         assert_eq!(why, "cut-capped");
     }
@@ -620,7 +622,7 @@ mod local_patch_tests {
         let mut seen = vec![];
         for _ in 0..4 {
             let traffic = st.current_kbps * 0.08;
-            let (next, _) = st.calculate_rate(&shaper, traffic, &deltas(35.0), TH, HIGH, 0.7, 0.0, &mut rng);
+            let (next, _) = st.calculate_rate(&shaper, traffic, &deltas(35.0), TH, HIGH, 0.7, 0.0, 0.3, &mut rng);
             st.current_kbps = next;
             seen.push(next);
         }
@@ -631,7 +633,7 @@ mod local_patch_tests {
     fn high_load_cut_is_not_capped() {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(12000.0);
-        let (next, why) = st.calculate_rate(&shaper, 11000.0, &deltas(30.0), TH, HIGH, 0.7, 0.0, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 11000.0, &deltas(30.0), TH, HIGH, 0.7, 0.0, 0.3, &mut rng);
         assert!(next <= 0.9 * 11000.0, "got {next}");
         assert_eq!(why, "cut");
     }
@@ -640,7 +642,7 @@ mod local_patch_tests {
     fn no_recovery_from_startup_seeds_alone() {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(5000.0);
-        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(0.0), TH, HIGH, 0.7, 3.0, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(0.0), TH, HIGH, 0.7, 3.0, 0.3, &mut rng);
         assert_eq!((next, why), (5000.0, "hold"));
     }
 
@@ -659,7 +661,7 @@ mod local_patch_tests {
         with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
         let mut path = vec![];
         for _ in 0..12 {
-            let (next, _) = st.calculate_rate(&shaper, 50.0, &[-1.0, 0.0, 0.0, 0.5, 1.0], TH, HIGH, 0.7, 3.0, &mut rng);
+            let (next, _) = st.calculate_rate(&shaper, 50.0, &[-1.0, 0.0, 0.0, 0.5, 1.0], TH, HIGH, 0.7, 3.0, 0.3, &mut rng);
             st.current_kbps = next;
             path.push(next);
         }
@@ -673,7 +675,7 @@ mod local_patch_tests {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(15000.0);
         with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
-        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(3.0), TH, HIGH, 0.7, 3.0, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(3.0), TH, HIGH, 0.7, 3.0, 0.3, &mut rng);
         assert_eq!((next, why), (14400.0, "recover-down"));
     }
 
@@ -683,8 +685,28 @@ mod local_patch_tests {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(10000.0);
         with_observed(&mut st, &[6000.0, 6000.0, 6000.0]);
-        let (next, why) = st.calculate_rate(&shaper, 9500.0, &deltas(10.0), TH, HIGH, 0.7, 3.0, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 9500.0, &deltas(10.0), TH, HIGH, 0.7, 3.0, 0.3, &mut rng);
         assert_eq!(why, "raise");
         assert!(next > 10000.0);
+    }
+
+    #[test]
+    fn moderate_load_cut_is_the_upstream_cut() {
+        // Mid-upload at 0.75 load (between low_load_level and high_load_level).
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(17000.0);
+        let traffic = 17000.0 * 0.75;
+        let (next, why) = st.calculate_rate(&shaper, traffic, &deltas(26.3), TH, HIGH, 0.7, 3.0, 0.3, &mut rng);
+        assert_eq!(why, "cut");
+        assert!(next <= 0.9 * traffic, "got {next}");
+    }
+
+    #[test]
+    fn moderate_load_with_low_delay_holds_as_upstream() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(13683.0);
+        with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
+        let (next, why) = st.calculate_rate(&shaper, 13683.0 * 0.79, &deltas(18.3), TH, HIGH, 0.7, 3.0, 0.3, &mut rng);
+        assert_eq!((next, why), (13683.0, "hold"));
     }
 }

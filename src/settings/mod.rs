@@ -458,6 +458,9 @@ pub(crate) struct AdvancedSettings {
     /// rate toward the median of the safe-rate history by this percentage of
     /// the base rate per evaluation (0 = off, the upstream behaviour).
     pub(crate) idle_recovery_pct: f64,
+    /// Load at or below which the two settings above act. Between this and
+    /// high_load_level the decision is the upstream one.
+    pub(crate) low_load_level: f64,
 }
 
 impl Default for AdvancedSettings {
@@ -473,6 +476,7 @@ impl Default for AdvancedSettings {
             dry_run: false,
             low_load_cut_floor: 0.0,
             idle_recovery_pct: 0.0,
+            low_load_level: 0.3,
         }
     }
 }
