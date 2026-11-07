@@ -372,6 +372,20 @@ impl AdvancedSettings {
             self.tick_interval,
         );
 
+        if !(0.0..1.0).contains(&self.low_load_cut_floor) {
+            report.error(
+                "advanced_settings.low_load_cut_floor",
+                "must be at least 0 and below 1",
+            );
+        }
+
+        if !(0.0..=1.0).contains(&self.low_load_level) {
+            report.error(
+                "advanced_settings.low_load_level",
+                "must be between 0 and 1",
+            );
+        }
+
         if self.speed_hist_size == 0 {
             report.error(
                 "advanced_settings.speed_hist_size",

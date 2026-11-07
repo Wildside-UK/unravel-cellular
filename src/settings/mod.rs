@@ -451,6 +451,12 @@ pub(crate) struct AdvancedSettings {
     pub(crate) upload_delay_ms: f64,
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) dry_run: bool,
+    /// Below high_load_level, a single cut may not take the rate under this
+    /// fraction of the current rate (0 = off, the upstream behaviour).
+    pub(crate) low_load_cut_floor: f64,
+    /// Load at or below which low_load_cut_floor acts. Between this and
+    /// high_load_level the decision is the upstream one.
+    pub(crate) low_load_level: f64,
 }
 
 impl Default for AdvancedSettings {
@@ -464,6 +470,8 @@ impl Default for AdvancedSettings {
             tick_interval: 0.5,
             upload_delay_ms: 15.0,
             dry_run: false,
+            low_load_cut_floor: 0.0,
+            low_load_level: 0.3,
         }
     }
 }

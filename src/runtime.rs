@@ -29,6 +29,13 @@ pub(crate) struct Shaper {
     pub(crate) max_kbps: Option<f64>,
 }
 
+#[cfg(test)]
+impl Shaper {
+    pub(crate) fn for_test(base_kbps: f64, min_kbps: f64) -> Self {
+        Self { interface: "test0".into(), base_kbps, min_kbps, max_kbps: None }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TrafficRates {
     pub _sampled_at: Instant,

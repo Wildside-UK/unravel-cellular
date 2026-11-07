@@ -52,6 +52,8 @@ impl RateState {
         deltas: &[f64],
         delay_threshold_ms: f64,
         high_load_level: f64,
+        low_load_cut_floor: f64,
+        low_load_level: f64,
         rng: &mut fastrand::Rng,
     ) -> (f64, &'static str) {
         let mut next_kbps = self.current_kbps;
@@ -83,6 +85,16 @@ impl RateState {
                     let rnd_rate = self.safe_rates[rng.usize(..self.safe_rates.len())];
                     next_kbps = rnd_rate.min(0.9 * traffic_kbps);
                     reason = "cut";
+
+                    // At low load, one tick over the threshold may
+                    // only take the rate down to a fraction of where it was.
+                    if low_load_cut_floor > 0.0 && load <= low_load_level {
+                        let capped = self.current_kbps * low_load_cut_floor;
+                        if next_kbps < capped {
+                            next_kbps = capped;
+                            reason = "cut-capped";
+                        }
+                    }
                 }
             }
         }
@@ -327,6 +339,8 @@ impl SqmaLaw {
                 deltas,
                 delay_ms,
                 self.settings.advanced_settings.high_load_level,
+                self.settings.advanced_settings.low_load_cut_floor,
+                self.settings.advanced_settings.low_load_level,
                 &mut self.rng,
             );
 
@@ -528,5 +542,78 @@ impl ReflectorState {
         self.valid = true;
 
         false
+    }
+}
+
+#[cfg(test)]
+mod low_load_cut_tests {
+    use super::*;
+    use crate::runtime::Shaper;
+
+    const TH: f64 = 25.0;
+    const HIGH: f64 = 0.8;
+
+    fn state(current: f64) -> (RateState, fastrand::Rng) {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut st = RateState::new(20000.0, 100, &mut rng);
+        st.current_kbps = current;
+        (st, rng)
+    }
+
+    fn deltas(median: f64) -> Vec<f64> {
+        vec![median - 10.0, median - 5.0, median, median + 5.0, median + 10.0]
+    }
+
+    #[test]
+    fn off_matches_upstream_low_load_cut_goes_to_floor() {
+        // 5 Nov run 1: 12000 kbit, 7.3% load, median 26.19 ms.
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.0, 0.3, &mut rng);
+        assert_eq!(next, 5000.0);
+        assert_eq!(why, "cut");
+    }
+
+    #[test]
+    fn cap_limits_a_single_low_load_cut() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.7, 0.3, &mut rng);
+        assert_eq!(next, 8400.0);
+        assert_eq!(why, "cut-capped");
+    }
+
+    #[test]
+    fn sustained_low_load_delay_still_reaches_the_floor() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let mut seen = vec![];
+        for _ in 0..4 {
+            let traffic = st.current_kbps * 0.08;
+            let (next, _) = st.calculate_rate(&shaper, traffic, &deltas(35.0), TH, HIGH, 0.7, 0.3, &mut rng);
+            st.current_kbps = next;
+            seen.push(next);
+        }
+        assert_eq!(seen, vec![8400.0, 5880.0, 5000.0, 5000.0]);
+    }
+
+    #[test]
+    fn high_load_cut_is_not_capped() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(12000.0);
+        let (next, why) = st.calculate_rate(&shaper, 11000.0, &deltas(30.0), TH, HIGH, 0.7, 0.3, &mut rng);
+        assert!(next <= 0.9 * 11000.0, "got {next}");
+        assert_eq!(why, "cut");
+    }
+
+    #[test]
+    fn moderate_load_cut_is_the_upstream_cut() {
+        // Mid-upload at 0.75 load (between low_load_level and high_load_level).
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(17000.0);
+        let traffic = 17000.0 * 0.75;
+        let (next, why) = st.calculate_rate(&shaper, traffic, &deltas(26.3), TH, HIGH, 0.7, 0.3, &mut rng);
+        assert_eq!(why, "cut");
+        assert!(next <= 0.9 * traffic, "got {next}");
     }
 }
