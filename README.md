@@ -1,3 +1,43 @@
+# unRAVEL-cellular
+
+A fork of [unRAVEL](https://github.com/Lochnair/unravel) (Nils Andreas Svee) with changes for mobile (LTE/5G) links, where the cell's capacity moves a lot and a single noisy tick can cost a lot of upload. Each change is off by default, so with no new options set this behaves exactly like upstream.
+
+Everything else about installing and configuring it is in the upstream README below.
+
+## What is different from upstream
+
+| Branch | Option(s) | What it does | Upstream |
+|---|---|---|---|
+| `decision-log` | none | Logs every rate decision at debug level with its reason (hold, raise, cut, ...) | not yet raised |
+| `low-load-cut-cap` | `low_load_cut_floor`, `low_load_level` | At low load, one tick over the delay threshold can only cut the rate to a fraction of where it was. Sustained delay still reaches the floor in a few ticks. | [#101](https://github.com/Lochnair/unravel/issues/101) |
+| `idle-recovery` | `idle_recovery_pct`, `low_load_level` | When the link is quiet and the delay is low, the rate drifts back toward the median of the rates the link has really carried, instead of staying wherever the last cut left it. | [#102](https://github.com/Lochnair/unravel/issues/102) |
+| `persist-history` | none | Keeps the learned rates in `/tmp` across a service restart (not a reboot). Upstream uses them on every raise and cut, and idle recovery steers by them, so a restart no longer falls back to guesses. | not yet raised |
+
+Suggested values (all in `advanced_settings`): `low_load_cut_floor 0.7`, `idle_recovery_pct 3`, `low_load_level 0.3`.
+
+## History
+
+unRAVEL-cellular began after the problems it addresses were reported upstream as [#101](https://github.com/Lochnair/unravel/issues/101) and [#102](https://github.com/Lochnair/unravel/issues/102). Its first versions were built on unRAVEL 0.5.0-rc1 and run on a live LTE link before the changes were split into the branches above. That line is kept unchanged on the `cellular-rc1` branch, with a tag on each version:
+
+| Tag | What it added |
+|---|---|
+| (upstream `5a13d29`) | stock unRAVEL 0.5.0-rc1, the starting point |
+| `v0.5.0-rc1-cellular.1` | low-load cut cap, idle recovery and the decision log, both acting below `high_load_level` |
+| `v0.5.0-rc1-cellular.2` | separate `low_load_level` (0.3), so neither acts mid-upload |
+| `v0.5.0-rc1-cellular.3` | learned rates kept across a service restart |
+
+Any of them can be checked out and built to get back to what ran at that point. The only difference is the version string: each tagged version reports its cellular version, while the binaries that actually ran reported plain `0.5.0-rc1`.
+
+## How the fork is kept
+
+- Each change lives on its own branch, rebased on upstream `master`, so each can be offered upstream on its own. `low-load-cut-cap` and `idle-recovery` build on `decision-log` (they name their decisions in its log line); `persist-history` stands alone.
+- `cellular` (the default branch) merges them all. It is the one to build.
+- Versions are `v<upstream version>-cellular.<n>`: the upstream release the build is based on, then this fork's counter, which restarts at each upstream release.
+- On each upstream release the branches are rebased. When a change is merged upstream it is dropped from here. The aim is for this fork to shrink.
+- The binary, `/etc/config/unravel` and the options keep their upstream names, so switching between this and upstream needs no reconfiguration.
+
+---
+
 # unRAVEL
 
 unRAVEL adjusts CAKE traffic shaping rates to keep latency under control on connections with fluctuating bandwidth. RAVEL stands for "Rate Adaptation Via Event-driven Logic", with a lowercase "un" in front. OpenWrt is the main target, though it can also run on other Linux systems with CAKE configured.
