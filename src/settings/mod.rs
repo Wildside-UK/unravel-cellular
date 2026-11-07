@@ -451,6 +451,10 @@ pub(crate) struct AdvancedSettings {
     pub(crate) upload_delay_ms: f64,
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) dry_run: bool,
+    /// File naming the current history key (line 1) and when the previous
+    /// key was last confirmed (line 2, unix seconds). Each key keeps its own
+    /// safe-rate history. Empty = off, one history for everything.
+    pub(crate) history_key_file: String,
 }
 
 impl Default for AdvancedSettings {
@@ -464,6 +468,7 @@ impl Default for AdvancedSettings {
             tick_interval: 0.5,
             upload_delay_ms: 15.0,
             dry_run: false,
+            history_key_file: String::new(),
         }
     }
 }
