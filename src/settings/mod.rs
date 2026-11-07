@@ -461,6 +461,10 @@ pub(crate) struct AdvancedSettings {
     /// Load at or below which the two settings above act. Between this and
     /// high_load_level the decision is the upstream one.
     pub(crate) low_load_level: f64,
+    /// File naming the current history key (line 1) and when the previous
+    /// key was last confirmed (line 2, unix seconds). Each key keeps its own
+    /// safe-rate history. Empty = off, one history for everything.
+    pub(crate) history_key_file: String,
 }
 
 impl Default for AdvancedSettings {
@@ -477,6 +481,7 @@ impl Default for AdvancedSettings {
             low_load_cut_floor: 0.0,
             idle_recovery_pct: 0.0,
             low_load_level: 0.3,
+            history_key_file: String::new(),
         }
     }
 }

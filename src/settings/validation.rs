@@ -393,6 +393,14 @@ impl AdvancedSettings {
             );
         }
 
+        let key_file = self.history_key_file.trim();
+        if !key_file.is_empty() && !std::path::Path::new(key_file).is_absolute() {
+            report.error(
+                "advanced_settings.history_key_file",
+                format!("must be an absolute path or empty, got {key_file}"),
+            );
+        }
+
         if self.speed_hist_size == 0 {
             report.error(
                 "advanced_settings.speed_hist_size",
@@ -502,6 +510,19 @@ mod tests {
             let mut report = ValidationReport::default();
             settings.validate(&mut report);
             assert!(report.finish().is_ok());
+        }
+    }
+
+    #[test]
+    fn history_key_file_must_be_empty_or_absolute() {
+        for (value, ok) in [("", true), ("/tmp/unravel-history-key", true), ("relative/key", false)] {
+            let settings = AdvancedSettings {
+                history_key_file: value.into(),
+                ..Default::default()
+            };
+            let mut report = ValidationReport::default();
+            settings.validate(&mut report);
+            assert_eq!(report.finish().is_ok(), ok, "{value}");
         }
     }
 
