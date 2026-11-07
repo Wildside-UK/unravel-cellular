@@ -12,6 +12,7 @@ Everything else about installing and configuring it is in the upstream README be
 | `low-load-cut-cap` | `low_load_cut_floor`, `low_load_level` | At low load, one tick over the delay threshold can only cut the rate to a fraction of where it was. Sustained delay still reaches the floor in a few ticks. | [#101](https://github.com/Lochnair/unravel/issues/101) |
 | `idle-recovery` | `idle_recovery_pct`, `low_load_level` | When the link is quiet and the delay is low, the rate drifts back toward the median of the rates the link has really carried, instead of staying wherever the last cut left it. | [#102](https://github.com/Lochnair/unravel/issues/102) |
 | `persist-history` | none | Keeps the learned rates in `/tmp` across a service restart (not a reboot). Upstream uses them on every raise and cut, and idle recovery steers by them, so a restart no longer falls back to guesses. | not yet raised |
+| `per-cell-history` | `history_key_file` | Keeps a separate set of learned rates per key, read from line 1 of a file that something else writes (for example the serving cell). On a new key the old set is filed away and the new key's set is loaded, or it starts from guesses. Line 2, if present, is the unix time the previous key was last confirmed; samples after it are dropped as ambiguous. Empty = off. | not yet raised |
 
 Suggested values (all in `advanced_settings`): `low_load_cut_floor 0.7`, `idle_recovery_pct 3`, `low_load_level 0.3`.
 
@@ -30,7 +31,7 @@ Any of them can be checked out and built to get back to what ran at that point. 
 
 ## How the fork is kept
 
-- Each change lives on its own branch, rebased on upstream `master`, so each can be offered upstream on its own. `low-load-cut-cap` and `idle-recovery` build on `decision-log` (they name their decisions in its log line); `persist-history` stands alone.
+- Each change lives on its own branch, rebased on upstream `master`, so each can be offered upstream on its own. `low-load-cut-cap` and `idle-recovery` build on `decision-log` (they name their decisions in its log line); `persist-history` stands alone; `per-cell-history` builds on it.
 - `cellular` (the default branch) merges them all. It is the one to build.
 - Versions are `v<upstream version>-cellular.<n>`: the upstream release the build is based on, then this fork's counter, which restarts at each upstream release.
 - On each upstream release the branches are rebased. When a change is merged upstream it is dropped from here. The aim is for this fork to shrink.
