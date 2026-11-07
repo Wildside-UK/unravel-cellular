@@ -477,6 +477,13 @@ impl SqmaLaw {
         // Before the first key, adopt what has been learned so far unless the
         // key already has its own history.
         if self.history_key.is_none() && !new_path.exists() {
+            // At startup nothing is in memory yet: file the single history
+            // under the first key so it is still loaded.
+            if !have_state && self.history_path.exists() {
+                if let Err(error) = std::fs::copy(&self.history_path, &new_path) {
+                    warn!("Could not copy {} to {}: {error}", self.history_path.display(), new_path.display());
+                }
+            }
             info!("History key is now {key}");
             self.history_key = Some(key);
             self.history_path = new_path;
@@ -1397,6 +1404,25 @@ mod per_cell_history_tests {
         write_key(&key, "A\n0\n", 1000);
         law.poll_history_key();
         assert_eq!(up(&law), vec![(6200.0, 5)]);
+    }
+
+    #[test]
+    fn first_key_at_startup_takes_over_the_single_history() {
+        let dir = temp_dir("startup");
+        let key = dir.0.join("key");
+        let now = unix_now();
+        let mut law = law(&dir.0, key.to_str().unwrap());
+        law.download = None;
+        law.upload = None;
+        let v1 = format!("{HISTORY_HEADER_V1}\nsaved {now}\nsize 100\nupload 20000 2 6200 6300\n");
+        std::fs::write(dir.0.join("unravel-history"), v1).unwrap();
+        write_key(&key, "A\n0\n", 1000);
+        law.poll_history_key();
+        assert_eq!(law.history_path, dir.0.join("unravel-history.A"));
+        let mut st = RateState::new(20000.0, 100, &mut law.rng);
+        law.restore_history("upload", 20000.0, &mut st);
+        assert_eq!(st.real_samples(), vec![(6200.0, 0), (6300.0, 0)]);
+        assert!(dir.0.join("unravel-history").exists(), "the single history is kept");
     }
 
     #[test]
