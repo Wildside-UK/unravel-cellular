@@ -4,11 +4,12 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    time::{Duration, Instant, SystemTime},
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::sync::watch;
 
 use crate::{
@@ -26,12 +27,82 @@ const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
 const RECENT_HALF_LIFE_SECS: f64 = 0.4;
 const STALE_AFTER: Duration = Duration::from_secs(30);
 
+// The real safe-rate samples are kept in RAM-backed /tmp so a
+// service restart does not throw them away. A reboot clears /tmp, and after a
+// reboot the cell may be different anyway, so starting from zero is right then.
+const HISTORY_PATH: &str = "/tmp/unravel-history";
+const HISTORY_SAVE_EVERY: Duration = Duration::from_secs(30);
+const HISTORY_MAX_AGE_SECS: u64 = 6 * 3600;
+const HISTORY_HEADER: &str = "unravel-history 1";
+
 struct RateState {
     current_kbps: f64,
     safe_rates: VecDeque<f64>,
     /// How many safe rates are real samples rather than the
     /// startup seeds (75-95% of base). Real samples sit at the back.
     observed: usize,
+    /// Base the history was learned against.
+    base_kbps: f64,
+}
+
+/// The saved history, without the header and time lines.
+/// One line per direction: `<name> <base> <count> <rate>...`, real samples only.
+fn history_body(size: usize, dirs: &[(&str, f64, &RateState)]) -> String {
+    let mut body = format!("size {size}\n");
+    for (name, base, state) in dirs {
+        let skip = state.safe_rates.len() - state.observed;
+        let real: Vec<String> = state.safe_rates.iter().skip(skip).map(|r| r.to_string()).collect();
+        body.push_str(&format!("{name} {base} {} {}\n", real.len(), real.join(" ")));
+    }
+    body
+}
+
+/// Parse a saved history. None if it is malformed, from a
+/// different history size, or older than HISTORY_MAX_AGE_SECS.
+fn parse_history(text: &str, now_unix: u64, size: usize) -> Option<Vec<(String, f64, Vec<f64>)>> {
+    let mut lines = text.lines();
+    if lines.next()? != HISTORY_HEADER {
+        return None;
+    }
+    let saved: u64 = lines.next()?.strip_prefix("saved ")?.parse().ok()?;
+    if saved > now_unix + 60 || now_unix.saturating_sub(saved) > HISTORY_MAX_AGE_SECS {
+        return None;
+    }
+    let saved_size: usize = lines.next()?.strip_prefix("size ")?.parse().ok()?;
+    if saved_size != size {
+        return None;
+    }
+    let mut dirs = vec![];
+    for line in lines {
+        let mut words = line.split_whitespace();
+        let name = words.next()?.to_string();
+        let base: f64 = words.next()?.parse().ok()?;
+        let count: usize = words.next()?.parse().ok()?;
+        let rates: Vec<f64> = words.map(|w| w.parse::<f64>()).collect::<Result<_, _>>().ok()?;
+        if !(base.is_finite() && base > 0.0)
+            || rates.len() != count
+            || count > size
+            || rates.iter().any(|r| !r.is_finite() || *r <= 0.0 || *r > 10.0 * base)
+        {
+            return None;
+        }
+        dirs.push((name, base, rates));
+    }
+    Some(dirs)
+}
+
+/// Put saved real samples at the back of the history, oldest first.
+fn restore_samples(state: &mut RateState, rates: &[f64]) {
+    let n = rates.len().min(state.safe_rates.len());
+    for r in &rates[rates.len() - n..] {
+        state.safe_rates.pop_front();
+        state.safe_rates.push_back(*r);
+    }
+    state.observed = n;
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 impl RateState {
@@ -46,6 +117,7 @@ impl RateState {
             current_kbps: base_speed,
             safe_rates: rates,
             observed: 0,
+            base_kbps: base_speed,
         }
     }
 
@@ -147,6 +219,11 @@ pub(crate) struct SqmaLaw {
     rng: fastrand::Rng,
     diagnostics: Option<DiagnosticsSender>,
 
+    // Restart-proof safe-rate history.
+    history_path: PathBuf,
+    history_saved_at: Option<Instant>,
+    history_saved_body: String,
+
     // TODO: Eventually the selector should do its own calculations,
     // and not depend on the law for measurements
     control_tx: watch::Sender<Option<ControlSnapshot>>,
@@ -208,6 +285,59 @@ impl SqmaLaw {
             rng: fastrand::Rng::new(),
             control_tx,
             diagnostics,
+            history_path: PathBuf::from(HISTORY_PATH),
+            history_saved_at: None,
+            history_saved_body: String::new(),
+        }
+    }
+
+    /// Put back the real samples saved before a restart.
+    fn restore_history(&self, name: &str, base_kbps: f64, state: &mut RateState) {
+        let Ok(text) = std::fs::read_to_string(&self.history_path) else {
+            return;
+        };
+        let size = state.safe_rates.len();
+        let Some(dirs) = parse_history(&text, unix_now(), size) else {
+            warn!("Ignoring {}: unreadable, stale or a different history size", self.history_path.display());
+            return;
+        };
+        let Some((_, saved_base, rates)) = dirs.iter().find(|(n, _, _)| n == name) else {
+            return;
+        };
+        if *saved_base != base_kbps {
+            info!("Not restoring {name} history: base was {saved_base}, now {base_kbps}");
+            return;
+        }
+        restore_samples(state, rates);
+        info!("Restored {} real {name} safe-rate samples", rates.len());
+    }
+
+    /// Write the real samples out, at most every 30 s and only if they changed.
+    fn save_history(&mut self, now: Instant) {
+        if self
+            .history_saved_at
+            .is_some_and(|t| now.saturating_duration_since(t) < HISTORY_SAVE_EVERY)
+        {
+            return;
+        }
+        let mut dirs = vec![];
+        for (name, state) in [("download", self.download.as_ref()), ("upload", self.upload.as_ref())] {
+            if let Some(state) = state {
+                dirs.push((name, state.base_kbps, state));
+            }
+        }
+        let size = dirs.first().map_or(0, |(_, _, s)| s.safe_rates.len());
+        let body = history_body(size, &dirs);
+        if body == self.history_saved_body {
+            return;
+        }
+        self.history_saved_at = Some(now);
+        let text = format!("{HISTORY_HEADER}\nsaved {}\n{body}", unix_now());
+        let tmp = self.history_path.with_extension("tmp");
+        let result = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &self.history_path));
+        match result {
+            Ok(()) => self.history_saved_body = body,
+            Err(error) => warn!("Could not save {}: {error}", self.history_path.display()),
         }
     }
 
@@ -221,6 +351,7 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
+            self.restore_history("download", shaper.base_kbps, &mut state);
 
             self.download = Some(state);
         }
@@ -232,6 +363,7 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
+            self.restore_history("upload", shaper.base_kbps, &mut state);
 
             self.upload = Some(state);
         }
@@ -397,6 +529,8 @@ impl SqmaLaw {
                 delta_delay: deltas[deltas.len() / 2],
             });
         }
+
+        self.save_history(now);
 
         if let Some(diagnostics) = &mut self.diagnostics {
             diagnostics.publish(now, |history_due| DiagnosticRecord {
@@ -578,7 +712,6 @@ impl ReflectorState {
 
 #[cfg(test)]
 mod low_load_cut_tests {
-mod idle_recovery_tests {
     use super::*;
     use crate::runtime::Shaper;
 
@@ -601,7 +734,7 @@ mod idle_recovery_tests {
         // 5 Nov run 1: 12000 kbit, 7.3% load, median 26.19 ms.
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(12000.0);
-        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.0, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.0, 0.0, 0.3, &mut rng);
         assert_eq!(next, 5000.0);
         assert_eq!(why, "cut");
     }
@@ -610,7 +743,7 @@ mod idle_recovery_tests {
     fn cap_limits_a_single_low_load_cut() {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(12000.0);
-        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.7, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 876.0, &deltas(26.19), TH, HIGH, 0.7, 0.0, 0.3, &mut rng);
         assert_eq!(next, 8400.0);
         assert_eq!(why, "cut-capped");
     }
@@ -622,7 +755,7 @@ mod idle_recovery_tests {
         let mut seen = vec![];
         for _ in 0..4 {
             let traffic = st.current_kbps * 0.08;
-            let (next, _) = st.calculate_rate(&shaper, traffic, &deltas(35.0), TH, HIGH, 0.7, 0.3, &mut rng);
+            let (next, _) = st.calculate_rate(&shaper, traffic, &deltas(35.0), TH, HIGH, 0.7, 0.0, 0.3, &mut rng);
             st.current_kbps = next;
             seen.push(next);
         }
@@ -633,7 +766,7 @@ mod idle_recovery_tests {
     fn high_load_cut_is_not_capped() {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(12000.0);
-        let (next, why) = st.calculate_rate(&shaper, 11000.0, &deltas(30.0), TH, HIGH, 0.7, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 11000.0, &deltas(30.0), TH, HIGH, 0.7, 0.0, 0.3, &mut rng);
         assert!(next <= 0.9 * 11000.0, "got {next}");
         assert_eq!(why, "cut");
     }
@@ -644,13 +777,36 @@ mod idle_recovery_tests {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(17000.0);
         let traffic = 17000.0 * 0.75;
-        let (next, why) = st.calculate_rate(&shaper, traffic, &deltas(26.3), TH, HIGH, 0.7, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, traffic, &deltas(26.3), TH, HIGH, 0.7, 0.0, 0.3, &mut rng);
         assert_eq!(why, "cut");
         assert!(next <= 0.9 * traffic, "got {next}");
+    }
+}
+
+#[cfg(test)]
+mod idle_recovery_tests {
+    use super::*;
+    use crate::runtime::Shaper;
+
+    const TH: f64 = 25.0;
+    const HIGH: f64 = 0.8;
+
+    fn state(current: f64) -> (RateState, fastrand::Rng) {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut st = RateState::new(20000.0, 100, &mut rng);
+        st.current_kbps = current;
+        (st, rng)
+    }
+
+    fn deltas(median: f64) -> Vec<f64> {
+        vec![median - 10.0, median - 5.0, median, median + 5.0, median + 10.0]
+    }
+
+    #[test]
     fn no_recovery_from_startup_seeds_alone() {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(5000.0);
-        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(0.0), TH, HIGH, 3.0, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(0.0), TH, HIGH, 0.0, 3.0, 0.3, &mut rng);
         assert_eq!((next, why), (5000.0, "hold"));
     }
 
@@ -669,7 +825,7 @@ mod idle_recovery_tests {
         with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
         let mut path = vec![];
         for _ in 0..12 {
-            let (next, _) = st.calculate_rate(&shaper, 50.0, &[-1.0, 0.0, 0.0, 0.5, 1.0], TH, HIGH, 3.0, 0.3, &mut rng);
+            let (next, _) = st.calculate_rate(&shaper, 50.0, &[-1.0, 0.0, 0.0, 0.5, 1.0], TH, HIGH, 0.0, 3.0, 0.3, &mut rng);
             st.current_kbps = next;
             path.push(next);
         }
@@ -683,7 +839,7 @@ mod idle_recovery_tests {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(15000.0);
         with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
-        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(3.0), TH, HIGH, 3.0, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(3.0), TH, HIGH, 0.0, 3.0, 0.3, &mut rng);
         assert_eq!((next, why), (14400.0, "recover-down"));
     }
 
@@ -693,7 +849,7 @@ mod idle_recovery_tests {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(10000.0);
         with_observed(&mut st, &[6000.0, 6000.0, 6000.0]);
-        let (next, why) = st.calculate_rate(&shaper, 9500.0, &deltas(10.0), TH, HIGH, 3.0, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 9500.0, &deltas(10.0), TH, HIGH, 0.0, 3.0, 0.3, &mut rng);
         assert_eq!(why, "raise");
         assert!(next > 10000.0);
     }
@@ -703,7 +859,133 @@ mod idle_recovery_tests {
         let shaper = Shaper::for_test(20000.0, 5000.0);
         let (mut st, mut rng) = state(13683.0);
         with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
-        let (next, why) = st.calculate_rate(&shaper, 13683.0 * 0.79, &deltas(18.3), TH, HIGH, 3.0, 0.3, &mut rng);
+        let (next, why) = st.calculate_rate(&shaper, 13683.0 * 0.79, &deltas(18.3), TH, HIGH, 0.0, 3.0, 0.3, &mut rng);
         assert_eq!((next, why), (13683.0, "hold"));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::runtime::Shaper;
+
+    fn state(current: f64) -> (RateState, fastrand::Rng) {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut st = RateState::new(20000.0, 100, &mut rng);
+        st.current_kbps = current;
+        (st, rng)
+    }
+
+    fn with_observed(st: &mut RateState, real: &[f64]) {
+        for r in real {
+            st.safe_rates.pop_front();
+            st.safe_rates.push_back(*r);
+        }
+        st.observed = real.len();
+    }
+
+    fn saved(st: &RateState, at: u64) -> String {
+        format!("{HISTORY_HEADER}\nsaved {at}\n{}", history_body(100, &[("upload", 20000.0, st)]))
+    }
+
+    #[test]
+    fn history_round_trips_only_the_real_samples() {
+        let (mut st, _) = state(6200.0);
+        with_observed(&mut st, &[6200.0, 6875.5, 7100.0]);
+        let dirs = parse_history(&saved(&st, 1000), 1010, 100).unwrap();
+        assert_eq!(dirs, vec![("upload".to_string(), 20000.0, vec![6200.0, 6875.5, 7100.0])]);
+    }
+
+    #[test]
+    fn empty_history_restores_nothing() {
+        let (st, _) = state(12000.0);
+        let dirs = parse_history(&saved(&st, 1000), 1010, 100).unwrap();
+        let (mut fresh, _) = state(12000.0);
+        restore_samples(&mut fresh, &dirs[0].2);
+        assert_eq!(fresh.observed, 0);
+    }
+
+    #[test]
+    fn stale_or_future_history_is_ignored() {
+        let (mut st, _) = state(6200.0);
+        with_observed(&mut st, &[6200.0]);
+        assert!(parse_history(&saved(&st, 1000), 1000 + HISTORY_MAX_AGE_SECS + 1, 100).is_none());
+        assert!(parse_history(&saved(&st, 5000), 1000, 100).is_none());
+        assert!(parse_history(&saved(&st, 1000), 1000 + HISTORY_MAX_AGE_SECS, 100).is_some());
+    }
+
+    #[test]
+    fn other_history_size_or_garbage_is_ignored() {
+        let (mut st, _) = state(6200.0);
+        with_observed(&mut st, &[6200.0]);
+        assert!(parse_history(&saved(&st, 1000), 1010, 50).is_none());
+        assert!(parse_history("", 1010, 100).is_none());
+        assert!(parse_history("unravel-history 2\nsaved 1000\nsize 100\n", 1010, 100).is_none());
+        let bad = format!("{HISTORY_HEADER}\nsaved 1000\nsize 100\nupload 20000 2 6200 NaN\n");
+        assert!(parse_history(&bad, 1010, 100).is_none());
+        let short = format!("{HISTORY_HEADER}\nsaved 1000\nsize 100\nupload 20000 3 6200 6300\n");
+        assert!(parse_history(&short, 1010, 100).is_none());
+        let wild = format!("{HISTORY_HEADER}\nsaved 1000\nsize 100\nupload 20000 1 900000\n");
+        assert!(parse_history(&wild, 1010, 100).is_none());
+    }
+
+    #[test]
+    fn history_file_is_written_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("unravel-hist-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unravel-history");
+        let (mut st, _) = state(6200.0);
+        with_observed(&mut st, &[6100.0, 6300.0]);
+        let text = saved(&st, unix_now());
+        std::fs::write(&path, &text).unwrap();
+        let back = std::fs::read_to_string(&path).unwrap();
+        let dirs = parse_history(&back, unix_now(), 100).unwrap();
+        assert_eq!(dirs[0].2, vec![6100.0, 6300.0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restored_samples_count_as_real_and_sit_at_the_back() {
+        let (mut st, _) = state(12000.0);
+        restore_samples(&mut st, &[6000.0, 6200.0, 6400.0]);
+        assert_eq!(st.observed, 3);
+        assert_eq!(st.safe_rates.len(), 100);
+        let tail: Vec<f64> = st.safe_rates.iter().skip(97).copied().collect();
+        assert_eq!(tail, vec![6000.0, 6200.0, 6400.0]);
+    }
+
+    #[test]
+    fn a_raise_counts_a_real_sample() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(10000.0);
+        let deltas = vec![0.0, 5.0, 10.0, 15.0, 20.0];
+        st.calculate_rate(&shaper, 9500.0, &deltas, 25.0, 0.8, 0.0, 0.0, 0.3, &mut rng);
+        assert_eq!(st.observed, 1);
+        assert_eq!(*st.safe_rates.back().unwrap(), 9500.0);
+    }
+}
+
+#[cfg(test)]
+mod cellular_tests {
+    // Needs idle recovery and the kept history together.
+    use super::*;
+    use crate::runtime::Shaper;
+
+    #[test]
+    fn restored_samples_switch_recovery_on_after_a_restart() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let mut rng = fastrand::Rng::with_seed(7);
+        let mut old = RateState::new(20000.0, 100, &mut rng);
+        restore_samples(&mut old, &[6000.0, 6200.0, 6400.0]);
+        let text = format!("{HISTORY_HEADER}\nsaved 1000\n{}", history_body(100, &[("upload", 20000.0, &old)]));
+        let dirs = parse_history(&text, 1010, 100).unwrap();
+
+        // A fresh start sits at 0.6 x base with only seeds: without the history it would hold.
+        let mut st = RateState::new(20000.0, 100, &mut rng);
+        st.current_kbps = 12000.0;
+        restore_samples(&mut st, &dirs[0].2);
+        let deltas = vec![-7.0, -2.0, 3.0, 8.0, 13.0];
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas, 25.0, 0.8, 0.0, 3.0, 0.3, &mut rng);
+        assert_eq!((next, why), (11400.0, "recover-down"));
     }
 }

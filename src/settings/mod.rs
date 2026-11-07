@@ -454,12 +454,11 @@ pub(crate) struct AdvancedSettings {
     /// Below high_load_level, a single cut may not take the rate under this
     /// fraction of the current rate (0 = off, the upstream behaviour).
     pub(crate) low_load_cut_floor: f64,
-    /// Load at or below which low_load_cut_floor acts. Between this and
     /// When the delay is under the threshold and load is not high, step the
     /// rate toward the median of the safe-rate history by this percentage of
     /// the base rate per evaluation (0 = off, the upstream behaviour).
     pub(crate) idle_recovery_pct: f64,
-    /// Load at or below which idle_recovery_pct acts. Between this and
+    /// Load at or below which the two settings above act. Between this and
     /// high_load_level the decision is the upstream one.
     pub(crate) low_load_level: f64,
 }
