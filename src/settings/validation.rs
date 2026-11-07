@@ -372,6 +372,20 @@ impl AdvancedSettings {
             self.tick_interval,
         );
 
+        if !(0.0..=1.0).contains(&self.low_load_level) {
+            report.error(
+                "advanced_settings.low_load_level",
+                "must be between 0 and 1",
+            );
+        }
+
+        if !(0.0..=100.0).contains(&self.idle_recovery_pct) {
+            report.error(
+                "advanced_settings.idle_recovery_pct",
+                "must be between 0 and 100",
+            );
+        }
+
         if self.speed_hist_size == 0 {
             report.error(
                 "advanced_settings.speed_hist_size",
