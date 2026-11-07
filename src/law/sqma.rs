@@ -29,6 +29,9 @@ const STALE_AFTER: Duration = Duration::from_secs(30);
 struct RateState {
     current_kbps: f64,
     safe_rates: VecDeque<f64>,
+    /// How many safe rates are real samples rather than the
+    /// startup seeds (75-95% of base). Real samples sit at the back.
+    observed: usize,
 }
 
 impl RateState {
@@ -42,6 +45,7 @@ impl RateState {
         Self {
             current_kbps: base_speed,
             safe_rates: rates,
+            observed: 0,
         }
     }
 
@@ -53,6 +57,7 @@ impl RateState {
         delay_threshold_ms: f64,
         high_load_level: f64,
         low_load_cut_floor: f64,
+        idle_recovery_pct: f64,
         low_load_level: f64,
         rng: &mut fastrand::Rng,
     ) -> (f64, &'static str) {
@@ -61,13 +66,14 @@ impl RateState {
 
         if !deltas.is_empty() {
             let delta = deltas[deltas.len() / 2];
+            let load = traffic_kbps / self.current_kbps;
 
             if delta > 0.0 {
-                let load = traffic_kbps / self.current_kbps;
 
                 if delta < delay_threshold_ms && load > high_load_level {
                     self.safe_rates.pop_front();
                     self.safe_rates.push_back(traffic_kbps.floor());
+                    self.observed = (self.observed + 1).min(self.safe_rates.len());
 
                     let max_rate = self
                         .safe_rates
@@ -95,6 +101,30 @@ impl RateState {
                             reason = "cut-capped";
                         }
                     }
+                }
+            }
+
+            // With the delay under the threshold and the link not
+            // busy, drift toward the median of the safe-rate history. Outside
+            // the delta > 0 check, as the idle median delta is often exactly 0.
+            // Only real samples count: the startup seeds would pull an idle
+            // link up to 75-95% of base after every restart.
+            if idle_recovery_pct > 0.0
+                && self.observed > 0
+                && delta <= delay_threshold_ms
+                && load <= low_load_level
+            {
+                let skip = self.safe_rates.len() - self.observed;
+                let mut rates: Vec<f64> = self.safe_rates.iter().skip(skip).copied().collect();
+                rates.sort_by(f64::total_cmp);
+                let target = rates[rates.len() / 2].max(shaper.min_kbps);
+                let step = shaper.base_kbps * idle_recovery_pct / 100.0;
+                if self.current_kbps < target {
+                    next_kbps = (self.current_kbps + step).min(target);
+                    reason = "recover-up";
+                } else if self.current_kbps > target {
+                    next_kbps = (self.current_kbps - step).max(target);
+                    reason = "recover-down";
                 }
             }
         }
@@ -340,6 +370,7 @@ impl SqmaLaw {
                 delay_ms,
                 self.settings.advanced_settings.high_load_level,
                 self.settings.advanced_settings.low_load_cut_floor,
+                self.settings.advanced_settings.idle_recovery_pct,
                 self.settings.advanced_settings.low_load_level,
                 &mut self.rng,
             );
@@ -547,6 +578,7 @@ impl ReflectorState {
 
 #[cfg(test)]
 mod low_load_cut_tests {
+mod idle_recovery_tests {
     use super::*;
     use crate::runtime::Shaper;
 
@@ -615,5 +647,63 @@ mod low_load_cut_tests {
         let (next, why) = st.calculate_rate(&shaper, traffic, &deltas(26.3), TH, HIGH, 0.7, 0.3, &mut rng);
         assert_eq!(why, "cut");
         assert!(next <= 0.9 * traffic, "got {next}");
+    fn no_recovery_from_startup_seeds_alone() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(5000.0);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(0.0), TH, HIGH, 3.0, 0.3, &mut rng);
+        assert_eq!((next, why), (5000.0, "hold"));
+    }
+
+    fn with_observed(st: &mut RateState, real: &[f64]) {
+        for r in real {
+            st.safe_rates.pop_front();
+            st.safe_rates.push_back(*r);
+        }
+        st.observed = real.len();
+    }
+
+    #[test]
+    fn recovery_steps_up_to_the_real_median_even_at_zero_delta() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(5000.0);
+        with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
+        let mut path = vec![];
+        for _ in 0..12 {
+            let (next, _) = st.calculate_rate(&shaper, 50.0, &[-1.0, 0.0, 0.0, 0.5, 1.0], TH, HIGH, 3.0, 0.3, &mut rng);
+            st.current_kbps = next;
+            path.push(next);
+        }
+        assert_eq!(path[0], 5600.0);
+        assert_eq!(*path.last().unwrap(), 11000.0);
+        assert!(path.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    #[test]
+    fn recovery_steps_down_toward_the_real_median() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(15000.0);
+        with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
+        let (next, why) = st.calculate_rate(&shaper, 50.0, &deltas(3.0), TH, HIGH, 3.0, 0.3, &mut rng);
+        assert_eq!((next, why), (14400.0, "recover-down"));
+    }
+
+    #[test]
+    fn busy_link_is_left_to_the_upstream_logic() {
+        // High load and low delay: the normal raise, not recovery.
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(10000.0);
+        with_observed(&mut st, &[6000.0, 6000.0, 6000.0]);
+        let (next, why) = st.calculate_rate(&shaper, 9500.0, &deltas(10.0), TH, HIGH, 3.0, 0.3, &mut rng);
+        assert_eq!(why, "raise");
+        assert!(next > 10000.0);
+    }
+
+    #[test]
+    fn moderate_load_with_low_delay_holds_as_upstream() {
+        let shaper = Shaper::for_test(20000.0, 5000.0);
+        let (mut st, mut rng) = state(13683.0);
+        with_observed(&mut st, &[10000.0, 11000.0, 12000.0]);
+        let (next, why) = st.calculate_rate(&shaper, 13683.0 * 0.79, &deltas(18.3), TH, HIGH, 3.0, 0.3, &mut rng);
+        assert_eq!((next, why), (13683.0, "hold"));
     }
 }

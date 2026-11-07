@@ -386,6 +386,13 @@ impl AdvancedSettings {
             );
         }
 
+        if !(0.0..=100.0).contains(&self.idle_recovery_pct) {
+            report.error(
+                "advanced_settings.idle_recovery_pct",
+                "must be between 0 and 100",
+            );
+        }
+
         if self.speed_hist_size == 0 {
             report.error(
                 "advanced_settings.speed_hist_size",
