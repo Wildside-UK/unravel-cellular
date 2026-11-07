@@ -53,8 +53,9 @@ impl RateState {
         delay_threshold_ms: f64,
         high_load_level: f64,
         rng: &mut fastrand::Rng,
-    ) -> f64 {
+    ) -> (f64, &'static str) {
         let mut next_kbps = self.current_kbps;
+        let mut reason = "hold";
 
         if !deltas.is_empty() {
             let delta = deltas[deltas.len() / 2];
@@ -75,16 +76,18 @@ impl RateState {
                     next_kbps = self.current_kbps
                         * (1.0 + 0.1 * (1.0_f64 - self.current_kbps / max_rate).max(0.0))
                         + (shaper.base_kbps * 0.03);
+                    reason = "raise";
                 }
 
                 if delta > delay_threshold_ms {
                     let rnd_rate = self.safe_rates[rng.usize(..self.safe_rates.len())];
                     next_kbps = rnd_rate.min(0.9 * traffic_kbps);
+                    reason = "cut";
                 }
             }
         }
 
-        next_kbps.max(shaper.min_kbps).floor()
+        (next_kbps.max(shaper.min_kbps).floor(), reason)
     }
 }
 
@@ -318,13 +321,23 @@ impl SqmaLaw {
             };
 
             let load = traffic_kbps / state.current_kbps;
-            let next = state.calculate_rate(
+            let (next, reason) = state.calculate_rate(
                 shaper,
                 traffic_kbps,
                 deltas,
                 delay_ms,
                 self.settings.advanced_settings.high_load_level,
                 &mut self.rng,
+            );
+
+            debug!(
+                "Decision {:?}: median delta {:.2} ms, load {:.3}, rate {} -> {} kbit ({})",
+                direction,
+                deltas[deltas.len() / 2],
+                load,
+                state.current_kbps,
+                next,
+                reason
             );
 
             if next != state.current_kbps {
