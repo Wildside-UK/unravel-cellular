@@ -457,7 +457,7 @@ pub(crate) struct AdvancedSettings {
     /// When the delay is under the threshold and load is not high, step the
     /// rate toward the median of the safe-rate history by this percentage of
     /// the base rate per evaluation (0 = off, the upstream behaviour).
-    pub(crate) idle_recovery_pct: f64,
+    pub(crate) idle_recovery_percent: f64,
     /// Load at or below which the two settings above act. Between this and
     /// high_load_level the decision is the upstream one.
     pub(crate) low_load_level: f64,
@@ -479,7 +479,7 @@ impl Default for AdvancedSettings {
             upload_delay_ms: 15.0,
             dry_run: false,
             low_load_cut_floor: 0.0,
-            idle_recovery_pct: 0.0,
+            idle_recovery_percent: 0.0,
             low_load_level: 0.3,
             history_key_file: String::new(),
         }
