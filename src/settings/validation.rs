@@ -400,6 +400,26 @@ impl AdvancedSettings {
             report.error("advanced_settings.history_file", "must be an absolute path");
         }
 
+        let history_file_set = self
+            .history_file
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty());
+        if let Some(path) = self.history_key_file.as_deref().map(str::trim)
+            && !path.is_empty()
+        {
+            if !path.starts_with('/') {
+                report.error(
+                    "advanced_settings.history_key_file",
+                    "must be an absolute path",
+                );
+            } else if !history_file_set {
+                report.warning(
+                    "advanced_settings.history_key_file",
+                    "has no effect without history_file",
+                );
+            }
+        }
+
         if self.speed_hist_size == 0 {
             report.error(
                 "advanced_settings.speed_hist_size",
@@ -529,5 +549,36 @@ mod tests {
         network(10_000.0, 10_000.0).validate(&mut report);
 
         assert!(report.finish().is_ok());
+    }
+    #[test]
+    fn history_key_file_must_be_absolute_and_wants_history_file() {
+        for (key_file, history_file, ok, warnings) in [
+            (None, None, true, 0),
+            (Some(""), None, true, 0),
+            (
+                Some("/tmp/unravel-history-key"),
+                Some("/tmp/unravel-history"),
+                true,
+                0,
+            ),
+            (Some("/tmp/unravel-history-key"), None, true, 1),
+            (Some("relative/key"), Some("/tmp/unravel-history"), false, 0),
+        ] {
+            let settings = AdvancedSettings {
+                history_key_file: key_file.map(Into::into),
+                history_file: history_file.map(Into::into),
+                ..Default::default()
+            };
+            let mut report = ValidationReport::default();
+            settings.validate(&mut report);
+            let found = report
+                .issues
+                .iter()
+                .filter(|i| i.path == "advanced_settings.history_key_file")
+                .filter(|i| matches!(i.severity, ValidationSeverity::Warning))
+                .count();
+            assert_eq!(found, warnings, "{key_file:?}");
+            assert_eq!(report.finish().is_ok(), ok, "{key_file:?}");
+        }
     }
 }

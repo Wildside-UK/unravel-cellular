@@ -466,6 +466,11 @@ pub(crate) struct AdvancedSettings {
     /// Read at startup if under 6 h old and saved with the same
     /// speed_hist_size and base rate. Unset = off, the upstream behaviour.
     pub(crate) history_file: Option<String>,
+    /// File naming the current history key (line 1) and when the previous
+    /// key was last confirmed (line 2, unix seconds). Each key keeps its own
+    /// safe-rate history in history_file.<key>. Needs history_file.
+    /// Unset = off, one history for everything.
+    pub(crate) history_key_file: Option<String>,
 }
 
 impl Default for AdvancedSettings {
@@ -483,6 +488,7 @@ impl Default for AdvancedSettings {
             idle_recovery_percent: 0.0,
             low_load_level: 0.3,
             history_file: None,
+            history_key_file: None,
         }
     }
 }
