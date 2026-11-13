@@ -205,7 +205,7 @@ impl RateState {
         delay_threshold_ms: f64,
         high_load_level: f64,
         low_load_cut_floor: f64,
-        idle_recovery_pct: f64,
+        idle_recovery_percent: f64,
         low_load_level: f64,
         rng: &mut fastrand::Rng,
     ) -> (f64, &'static str) {
@@ -261,7 +261,7 @@ impl RateState {
             // the delta > 0 check, as the idle median delta is often exactly 0.
             // Only real samples count: the startup seeds would pull an idle
             // link up to 75-95% of base after every restart.
-            if idle_recovery_pct > 0.0
+            if idle_recovery_percent > 0.0
                 && self.observed > 0
                 && delta <= delay_threshold_ms
                 && load <= low_load_level
@@ -270,7 +270,7 @@ impl RateState {
                 let mut rates: Vec<f64> = self.safe_rates.iter().skip(skip).copied().collect();
                 rates.sort_by(f64::total_cmp);
                 let target = rates[rates.len() / 2].max(shaper.min_kbps);
-                let step = shaper.base_kbps * idle_recovery_pct / 100.0;
+                let step = shaper.base_kbps * idle_recovery_percent / 100.0;
                 if self.current_kbps < target {
                     next_kbps = (self.current_kbps + step).min(target);
                     reason = "recover-up";
@@ -687,7 +687,7 @@ impl SqmaLaw {
                 delay_ms,
                 self.settings.advanced_settings.high_load_level,
                 self.settings.advanced_settings.low_load_cut_floor,
-                self.settings.advanced_settings.idle_recovery_pct,
+                self.settings.advanced_settings.idle_recovery_percent,
                 self.settings.advanced_settings.low_load_level,
                 &mut self.rng,
             );

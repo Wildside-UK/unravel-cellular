@@ -386,9 +386,9 @@ impl AdvancedSettings {
             );
         }
 
-        if !(0.0..=100.0).contains(&self.idle_recovery_pct) {
+        if !(0.0..=100.0).contains(&self.idle_recovery_percent) {
             report.error(
-                "advanced_settings.idle_recovery_pct",
+                "advanced_settings.idle_recovery_percent",
                 "must be between 0 and 100",
             );
         }

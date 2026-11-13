@@ -10,11 +10,11 @@ Everything else about installing and configuring it is in the upstream README be
 |---|---|---|---|
 | `decision-log` | none | Logs every rate decision at debug level with its reason (hold, raise, cut, ...) | not yet raised |
 | `low-load-cut-cap` | `low_load_cut_floor`, `low_load_level` | At low load, one tick over the delay threshold can only cut the rate to a fraction of where it was. Sustained delay still reaches the floor in a few ticks. | [#101](https://github.com/Lochnair/unravel/issues/101) |
-| `idle-recovery` | `idle_recovery_pct`, `low_load_level` | When the link is quiet and the delay is low, the rate drifts back toward the median of the rates the link has really carried, instead of staying wherever the last cut left it. | [#102](https://github.com/Lochnair/unravel/issues/102) |
+| `idle-recovery` | `idle_recovery_percent`, `low_load_level` | When the link is quiet and the delay is low, the rate drifts back toward the median of the rates the link has really carried, instead of staying wherever the last cut left it. | [#102](https://github.com/Lochnair/unravel/issues/102) |
 | `persist-history` | none | Keeps the learned rates in `/tmp` across a service restart (not a reboot). Upstream uses them on every raise and cut, and idle recovery steers by them, so a restart no longer falls back to guesses. | not yet raised |
 | `per-cell-history` | `history_key_file` | Keeps a separate set of learned rates per key, read from line 1 of a file that something else writes (for example the serving cell). On a new key the old set is filed away and the new key's set is loaded, or it starts from guesses. Line 2, if present, is the unix time the previous key was last confirmed; samples after it are dropped as ambiguous. Empty = off. | not yet raised |
 
-Suggested values (all in `advanced_settings`): `low_load_cut_floor 0.7`, `idle_recovery_pct 3`, `low_load_level 0.3`.
+Suggested values (all in `advanced_settings`): `low_load_cut_floor 0.7`, `idle_recovery_percent 3`, `low_load_level 0.3`.
 
 ## History
 
