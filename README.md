@@ -1,3 +1,44 @@
+# unRAVEL-cellular
+
+A fork of [unRAVEL](https://github.com/Lochnair/unravel) (Nils Andreas Svee) with changes for mobile (LTE/5G) links, where the cell's capacity moves a lot and a single noisy tick can cost a lot of upload. Each change is off by default, so with no new options set this behaves exactly like upstream.
+
+Everything else about installing and configuring it is in the upstream README below.
+
+## What is different from upstream
+
+| Branch | Option(s) | What it does | Upstream |
+|---|---|---|---|
+| `per-cell-history` | `history_key_file` (needs `history_file`) | Keeps a separate set of learned rates per key, read from line 1 of a file that something else writes (for example the serving cell). On a new key the old set is filed away and the new key's set is loaded, or it starts from guesses. Line 2, if present, is the unix time the previous key was last confirmed; samples after it are dropped as ambiguous. Unset = off. Each key's rates are kept in `<history_file>.<key>`. | not yet raised |
+
+Now upstream, so no longer carried here: the low-load cut cap (`low_load_cut_floor`, [#104](https://github.com/Lochnair/unravel/pull/104)), idle recovery (`idle_recovery_percent`, [#105](https://github.com/Lochnair/unravel/pull/105)) and keeping the learned rates across a restart (`history_file`, [#106](https://github.com/Lochnair/unravel/pull/106)). The `decision-log` branch (each rate decision logged at debug level) is no longer carried either; its branch is kept as it was.
+
+Suggested values (all in `advanced_settings`): `low_load_cut_floor 0.7`, `idle_recovery_percent 3`, `low_load_level 0.3`, `history_file /tmp/unravel-history`, and `history_key_file` pointing at whatever writes the key.
+
+## History
+
+unRAVEL-cellular began after the problems it addresses were reported upstream as [#101](https://github.com/Lochnair/unravel/issues/101) and [#102](https://github.com/Lochnair/unravel/issues/102). Its first versions were built on unRAVEL 0.5.0-rc1 and run on a live LTE link before the changes were split into branches. That line is kept unchanged on the `cellular-rc1` branch, with a tag on each version:
+
+| Tag | What it added |
+|---|---|
+| (upstream `5a13d29`) | stock unRAVEL 0.5.0-rc1, the starting point |
+| `v0.5.0-rc1-cellular.1` | low-load cut cap, idle recovery and the decision log, both acting below `high_load_level` |
+| `v0.5.0-rc1-cellular.2` | separate `low_load_level` (0.3), so neither acts mid-upload |
+| `v0.5.0-rc1-cellular.3` | learned rates kept across a service restart |
+
+The fourth generation (`v0.5.0-rc1-cellular.4`, `.4.1`, `.4.2`) carried all five branches on upstream `master` before #104-#106 were merged. It is kept unchanged on the `cellular-4` branch, with its `per-cell-history` on `per-cell-history-4`. From `v0.5.0-rc1-cellular.5` the fork carries only `per-cell-history`, ported to upstream's `history_file` and async history IO.
+
+Any of them can be checked out and built to get back to what ran at that point. For `.1` to `.3` the only difference is the version string: each tagged version reports its cellular version, while the binaries that actually ran reported plain `0.5.0-rc1`.
+
+## How the fork is kept
+
+- Each change lives on its own branch, rebased on upstream `master`, so each can be offered upstream on its own.
+- `cellular` (the default branch) merges them all. It is the one to build.
+- Versions are `v<upstream version>-cellular.<n>`: the upstream release the build is based on, then this fork's counter, which restarts at each upstream release. A fix to a release is `.<n>.1`, `.<n>.2`.
+- On each upstream release the branches are rebased. When a change is merged upstream it is dropped from here. The aim is for this fork to shrink.
+- The binary, `/etc/config/unravel` and the options keep their upstream names, so switching between this and upstream needs no reconfiguration.
+
+---
+
 # unRAVEL
 
 unRAVEL adjusts CAKE traffic shaping rates to keep latency under control on connections with fluctuating bandwidth. RAVEL stands for "Rate Adaptation Via Event-driven Logic", with a lowercase "un" in front. OpenWrt is the main target, though it can also run on other Linux systems with CAKE configured.
